@@ -229,7 +229,7 @@ To minimize context usage, the system applies **three levels of loading**:
 * Loaded only if referenced in `SKILL.md`
 * Used for detailed rules or formats
 
-➡️ This approach minimizes noise, cost, and hallucinations.
+This approach minimizes noise, cost, and hallucinations.
 
 ---
 
