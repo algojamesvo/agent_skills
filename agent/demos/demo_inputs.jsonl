@@ -1,0 +1,3 @@
+{"id":"string_utils_1","input":"Slugify this title and also count words: 'TSR Agent: Input → Agent → Structured Tables'"}
+{"id":"tsr_1","input":"Extract table structure as HTML from image at ./sample_table.png using TSR backend."}
+{"id":"tsr_2","input":"Use perception backend to extract table. If output is OTSL, convert to HTML and save to outputs/table.html. Image: ./sample_table.png"}

@@ -1,0 +1,2 @@
+- Slug should be lowercase, hyphen-separated, ASCII only.
+- Avoid trailing hyphens.
