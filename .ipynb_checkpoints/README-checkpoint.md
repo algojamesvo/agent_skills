@@ -10,6 +10,7 @@ The current focus is a **Table Structure Recognition (TSR)** prototype, which se
 
 ![Structure Diagram](docs/structure.png)
 
+![Structure Diagram](docs/flow.png)
 
 ---
 
