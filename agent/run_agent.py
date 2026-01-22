@@ -3,7 +3,8 @@ import os
 import json
 import re
 import argparse
-from typing import List, Dict, Any, Optional, Tuple
+import time
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 from openai import OpenAI
 
@@ -82,6 +83,14 @@ def _extract_reference_paths(skill_body: str) -> List[str]:
     return out
 
 
+def _stable_json(obj: Any) -> str:
+    """Stable JSON string for repeat-detection signatures."""
+    try:
+        return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(obj)
+
+
 def _get_item_type(item):
     if isinstance(item, dict):
         return item.get("type")
@@ -158,6 +167,14 @@ def _trace_write(fp, event: Dict[str, Any]):
     fp.flush()
 
 
+def _parse_args_obj(args: Any) -> Dict[str, Any]:
+    if isinstance(args, str):
+        return json.loads(args) if args else {}
+    if isinstance(args, dict):
+        return args
+    return {}
+
+
 # ---------------------------
 # Core runner (single case)
 # ---------------------------
@@ -173,6 +190,9 @@ def run_single_case(
     debug: bool,
     trace: bool,
     max_log_chars: int,
+    max_loops: int,
+    max_tool_retries: int,
+    repeat_limit: int,
     trace_fp=None,
     case_id: str = "case",
 ) -> str:
@@ -181,6 +201,8 @@ def run_single_case(
     Adds:
       - progress/debug/trace logging
       - optional JSONL trace file
+      - safety guards: max_loops, repeat_limit
+      - tool retry policy: exceptions or output dict containing {"error": ...}
     """
     executors = runtime["executors"]
 
@@ -212,6 +234,10 @@ def run_single_case(
     loaded_references = set()
 
     loop_idx = 0
+    end_reason = "unknown"
+
+    # Repeat detection: signature = f"{tool}:{stable_json(args_obj)}" -> count
+    repeat_counts: Dict[str, int] = {}
 
     _log(progress, f"[{case_id}] START")
     _trace_write(trace_fp, {
@@ -220,16 +246,41 @@ def run_single_case(
         "model": MODEL,
         "base_url": DEFAULT_BASE_URL,
         "user_text": user_text,
+        "max_loops": max_loops,
+        "max_tool_retries": max_tool_retries,
+        "repeat_limit": repeat_limit,
     })
+
+    resp = None
 
     while True:
         loop_idx += 1
+
+        if loop_idx > max_loops:
+            end_reason = "max_loops"
+            _log(True, f"[{case_id}] [loop {loop_idx}] reached max_loops={max_loops} -> stopping")
+            _trace_write(trace_fp, {
+                "type": "loop_stop",
+                "case_id": case_id,
+                "loop": loop_idx,
+                "end_reason": end_reason,
+            })
+            # Give a small in-context signal to finish best-effort
+            input_list.append({
+                "role": "system",
+                "content": f"[Agent stopped] Reached max_loops={max_loops}. Provide best-effort final answer with current info.",
+            })
+            # One last model call to produce final answer (optional)
+            resp = client.responses.create(
+                model=MODEL,
+                instructions=instructions,
+                tools=tools,
+                input=input_list,
+            )
+            break
+
         _log(progress, f"[{case_id}] [loop {loop_idx}] calling model...")
-        _trace_write(trace_fp, {
-            "type": "loop_start",
-            "case_id": case_id,
-            "loop": loop_idx,
-        })
+        _trace_write(trace_fp, {"type": "loop_start", "case_id": case_id, "loop": loop_idx})
 
         resp = client.responses.create(
             model=MODEL,
@@ -243,11 +294,10 @@ def run_single_case(
 
         out_items = getattr(resp, "output", []) or []
 
-        # Trace: show output item types / reasoning (if any)
+        # Trace: show output item snapshots
         if trace:
             for it in out_items:
                 it_type = _get_item_type(it)
-                # try typical fields
                 if isinstance(it, dict):
                     snapshot = {
                         "type": it_type,
@@ -273,23 +323,23 @@ def run_single_case(
             "case_id": case_id,
             "loop": loop_idx,
             "num_items": len(out_items),
-            # keep small; raw objects can be huge / non-serializable
             "item_types": [(_get_item_type(it) or "unknown") for it in out_items],
         })
 
         tool_calls = [it for it in out_items if _get_item_type(it) == "function_call"]
+        _log(progress, f"[{case_id}] [loop {loop_idx}] tool_calls={len(tool_calls)}")
 
         if not tool_calls:
+            end_reason = "no_tool_calls"
             _log(progress, f"[{case_id}] [loop {loop_idx}] no tool calls -> finishing")
             _trace_write(trace_fp, {
                 "type": "loop_end",
                 "case_id": case_id,
                 "loop": loop_idx,
                 "ended": True,
+                "end_reason": end_reason,
             })
             break
-
-        _log(progress, f"[{case_id}] [loop {loop_idx}] tool_calls={len(tool_calls)}")
 
         # Log tool calls
         for call in tool_calls:
@@ -332,7 +382,7 @@ def run_single_case(
                     "skill": sname,
                 })
 
-        # 2) References on-demand:
+        # 2) References on-demand
         skills_to_check_refs = set(newly_loaded_skills)
         for call in tool_calls:
             tname = _get_call_name(call)
@@ -395,7 +445,9 @@ def run_single_case(
                     "abs_path": abs_ref,
                 })
 
-        # 3) Execute tool calls locally and append outputs
+        # 3) Execute tool calls
+        stopped_by_repeat = False
+
         for call in tool_calls:
             name = _get_call_name(call)
             args = _get_call_arguments(call)
@@ -421,19 +473,78 @@ def run_single_case(
 
             if name not in executors:
                 output = {"error": f"Tool not found: {name}"}
-            else:
-                try:
-                    if isinstance(args, str):
-                        args_obj = json.loads(args) if args else {}
-                    elif isinstance(args, dict):
-                        args_obj = args
-                    else:
-                        args_obj = {}
+                input_list.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps(output, ensure_ascii=False),
+                })
+                _log(debug, f"[{case_id}] [out]  {name} -> {_truncate(output, max_log_chars)}")
+                _trace_write(trace_fp, {
+                    "type": "tool_output",
+                    "case_id": case_id,
+                    "loop": loop_idx,
+                    "name": name,
+                    "call_id": call_id,
+                    "output": output,
+                })
+                continue
 
-                    _log(debug, f"[{case_id}] [exec] {name} args_obj={_truncate(args_obj, max_log_chars)}")
-                    output = executors[name](**args_obj)
+            args_obj = _parse_args_obj(args)
+
+            # Repeat guard
+            sig = f"{name}:{_stable_json(args_obj)}"
+            repeat_counts[sig] = repeat_counts.get(sig, 0) + 1
+            if repeat_counts[sig] > repeat_limit:
+                end_reason = "repeated_calls"
+                stopped_by_repeat = True
+                _log(True, f"[{case_id}] [stop] repeated_calls: {name} same args count={repeat_counts[sig]} > repeat_limit={repeat_limit}")
+                _trace_write(trace_fp, {
+                    "type": "loop_stop",
+                    "case_id": case_id,
+                    "loop": loop_idx,
+                    "end_reason": end_reason,
+                    "tool": name,
+                    "args_obj": args_obj,
+                    "count": repeat_counts[sig],
+                    "repeat_limit": repeat_limit,
+                })
+                # Signal model to finish best-effort
+                input_list.append({
+                    "role": "system",
+                    "content": (
+                        f"[Agent stopped] Detected repeated tool calls for '{name}' with identical arguments "
+                        f"(>{repeat_limit} times). Provide best-effort final answer."
+                    ),
+                })
+                break
+
+            # Retry policy
+            output: Any = None
+            last_err: Optional[str] = None
+
+            for attempt in range(max_tool_retries + 1):
+                try:
+                    _log(debug, f"[{case_id}] [exec] {name} attempt={attempt+1}/{max_tool_retries+1} args_obj={_truncate(args_obj, max_log_chars)}")
+                    out0 = executors[name](**args_obj)
+                    output = out0
+
+                    # tool returned structured error?
+                    if isinstance(out0, dict) and out0.get("error"):
+                        last_err = str(out0.get("error"))
+                        if attempt < max_tool_retries:
+                            sleep_s = 0.5 * (2 ** attempt)
+                            _log(debug, f"[{case_id}] [retry] {name} tool_error={last_err!r} sleep={sleep_s:.1f}s")
+                            time.sleep(sleep_s)
+                            continue
+                    break
                 except Exception as e:
-                    output = {"error": str(e)}
+                    last_err = str(e)
+                    if attempt < max_tool_retries:
+                        sleep_s = 0.5 * (2 ** attempt)
+                        _log(debug, f"[{case_id}] [retry] {name} exception={last_err!r} sleep={sleep_s:.1f}s")
+                        time.sleep(sleep_s)
+                        continue
+                    output = {"error": last_err}
 
             input_list.append({
                 "type": "function_call_output",
@@ -443,7 +554,6 @@ def run_single_case(
 
             _log(debug, f"[{case_id}] [out]  {name} -> {_truncate(output, max_log_chars)}")
 
-            # Friendly progress for artifacts
             if name == "save_html" and isinstance(output, dict) and output.get("out_path"):
                 _log(True, f"[{case_id}] [artifact] saved HTML -> {output.get('out_path')}")
 
@@ -461,18 +571,30 @@ def run_single_case(
             "case_id": case_id,
             "loop": loop_idx,
             "ended": False,
+            "end_reason": end_reason,
         })
 
-    final_text = resp.output_text
+        if stopped_by_repeat:
+            # One last model call to produce final answer (optional)
+            resp = client.responses.create(
+                model=MODEL,
+                instructions=instructions,
+                tools=tools,
+                input=input_list,
+            )
+            break
+
+    final_text = resp.output_text if resp is not None else ""
     _trace_write(trace_fp, {
         "type": "case_end",
         "case_id": case_id,
         "final_output_text": final_text,
         "loops": loop_idx,
+        "end_reason": end_reason,
         "loaded_skills": sorted(list(loaded_skills)),
         "loaded_references": sorted([f"{a}:{b}" for (a, b) in loaded_references]),
     })
-    _log(progress, f"[{case_id}] DONE (loops={loop_idx})")
+    _log(progress, f"[{case_id}] DONE (loops={loop_idx}) end_reason={end_reason}")
     return final_text
 
 
@@ -492,6 +614,11 @@ def main():
     parser.add_argument("--trace_file", type=str, default=None, help="Write JSONL trace logs to this file.")
     parser.add_argument("--max_log_chars", type=int, default=800, help="Truncate long logs.")
 
+    # Safety / stability
+    parser.add_argument("--max_loops", type=int, default=int(os.getenv("AGENT_MAX_LOOPS", "8")), help="Max agent loops per case.")
+    parser.add_argument("--max_tool_retries", type=int, default=int(os.getenv("AGENT_MAX_TOOL_RETRIES", "1")), help="Retries per tool call (error/exception).")
+    parser.add_argument("--repeat_limit", type=int, default=int(os.getenv("AGENT_REPEAT_LIMIT", "3")), help="Stop if same tool+args repeats more than this.")
+
     args = parser.parse_args()
 
     # Default behavior: show progress if debug/trace is enabled
@@ -499,6 +626,10 @@ def main():
     debug = bool(args.debug)
     trace = bool(args.trace)
     max_log_chars = int(args.max_log_chars)
+
+    max_loops = int(args.max_loops)
+    max_tool_retries = int(args.max_tool_retries)
+    repeat_limit = int(args.repeat_limit)
 
     # Load skills
     tools, runtime = load_all_skills(SKILLS_ROOT)
@@ -546,6 +677,9 @@ def main():
                 debug=debug,
                 trace=trace,
                 max_log_chars=max_log_chars,
+                max_loops=max_loops,
+                max_tool_retries=max_tool_retries,
+                repeat_limit=repeat_limit,
                 trace_fp=trace_fp,
                 case_id=case_id,
             )
